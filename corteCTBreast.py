@@ -705,8 +705,30 @@ def desenhar_linhas_paciente(caminho_ct, pasta_saida, fatia_referencia_corte=Non
     return linhas
 
 
+def ler_intervalo(texto):
+    """'P1 a P3', 'P1-P3', '1 3', '1-3' -> (1, 3);  'P5' ou '5' -> (5, 5)."""
+    nums = [int(n) for n in re.findall(r"\d+", str(texto))]
+    if not nums or len(nums) > 2:
+        raise ValueError(f"intervalo invalido: '{texto}' (use, por exemplo, P1 a P3)")
+    a, b = nums[0], nums[-1]
+    return (min(a, b), max(a, b))
+
+
+def perguntar_intervalo(prefixo, disponiveis):
+    nums = [int(re.sub(r"\D", "", d)) for d in disponiveis]
+    print(f"Pastas encontradas: {prefixo}{min(nums)} a {prefixo}{max(nums)} ({len(nums)} pastas)")
+    while True:
+        txt = input(f"Quais pastas processar? (ex.: {prefixo}1 a {prefixo}3; Enter = todas): ").strip()
+        if not txt:
+            return (min(nums), max(nums))
+        try:
+            return ler_intervalo(txt)
+        except ValueError as e:
+            print("  ", e)
+
+
 def processar_lote(pasta_raiz, etapa="tudo", prefixo_paciente="P", pular_prontos=True,
-                   refazer_linhas=False, **kw):
+                   refazer_linhas=False, intervalo=None, **kw):
     """
     Roda todas as pastas de paciente (P1, P2, ..., ordem natural) dentro de pasta_raiz.
     Cada paciente tem uma pasta '2-CTAC...' (TC) e, se houver, '3-PET...'. O resultado vai para
@@ -717,13 +739,27 @@ def processar_lote(pasta_raiz, etapa="tudo", prefixo_paciente="P", pular_prontos
             "tudo"    : para cada paciente, desenha (se ainda nao tiver as retas) e simula.
     pular_prontos : nao simula de novo quem ja tem Imagens_cortadas/resultado_mamas.png
     refazer_linhas: desenha de novo mesmo quem ja tem linhas_corte.json
+    intervalo     : (primeiro, ultimo), ex. (1, 3) = P1 a P3; texto "P1 a P3"; None = pergunta na hora
     kw: os demais argumentos de processar (parametros_simulador, salvar_ct, ...).
     """
     pacientes = sorted([d for d in os.listdir(pasta_raiz)
                         if os.path.isdir(os.path.join(pasta_raiz, d))
                         and re.fullmatch(re.escape(prefixo_paciente) + r"\d+", d, flags=re.IGNORECASE)],
                        key=ordem_natural)
-    print(f"{len(pacientes)} pastas de paciente em {pasta_raiz} (etapa: {etapa})")
+    if not pacientes:
+        print(f"Nenhuma pasta {prefixo_paciente}<numero> em {pasta_raiz}")
+        return []
+    if intervalo is None:
+        intervalo = perguntar_intervalo(prefixo_paciente, pacientes)
+    elif isinstance(intervalo, str):
+        intervalo = ler_intervalo(intervalo)
+    a, b = intervalo
+    pacientes = [d for d in pacientes if a <= int(re.sub(r"\D", "", d)) <= b]
+    faltando = sorted(set(range(a, b + 1)) - {int(re.sub(r"\D", "", d)) for d in pacientes})
+    print(f"{len(pacientes)} pastas de {prefixo_paciente}{a} a {prefixo_paciente}{b} em {pasta_raiz} (etapa: {etapa})")
+    if faltando:
+        print(f"   ATENCAO: nao existem as pastas {', '.join(prefixo_paciente + str(n) for n in faltando[:20])}"
+              + (" ..." if len(faltando) > 20 else ""))
     if not pacientes:
         return []
     kw = dict(kw, confirmar=False, mostrar_figuras=False)    # em lote nao para para perguntar
@@ -773,7 +809,8 @@ def processar_lote(pasta_raiz, etapa="tudo", prefixo_paciente="P", pular_prontos
         log.append((nome, situacao, obs, dt))
         print(f"   -> {nome}: {situacao} ({obs}) em {dt / 60:.1f} min")
 
-    arq_log = os.path.join(pasta_raiz, f"log_lote_{etapa}_{datetime.datetime.now():%Y%m%d_%H%M}.csv")
+    arq_log = os.path.join(pasta_raiz, f"log_lote_{etapa}_{prefixo_paciente}{a}-{prefixo_paciente}{b}_"
+                                       f"{datetime.datetime.now():%Y%m%d_%H%M}.csv")
     with open(arq_log, "w", encoding="utf-8") as f:
         f.write("paciente;situacao;observacao;minutos\n")
         for nome, sit, obs, dt in log:
@@ -951,6 +988,8 @@ if __name__ == "__main__":
     EXECUCAO = "lote"
     PASTA_RAIZ = PASTA_SCRIPT       # pasta que contem P1, P2, ..., P110
     PREFIXO_PACIENTE = "P"          # nome das pastas de paciente: P + numero
+    INTERVALO_PACIENTES = None      # None = o programa pergunta ao iniciar (ex.: P1 a P3)
+                                    # ou fixe aqui: (1, 3) ou "P1 a P3"
     # ETAPA (so no lote)
     #   "desenhar": abre as janelas e grava as retas de todos os pacientes, sem simular (rapido).
     #   "simular" : simula todos que ja tem as retas gravadas - pode deixar rodando sozinho.
@@ -1004,6 +1043,7 @@ if __name__ == "__main__":
     if EXECUCAO == "lote":
         processar_lote(PASTA_RAIZ, etapa=ETAPA, prefixo_paciente=PREFIXO_PACIENTE,
                        pular_prontos=PULAR_PRONTOS, refazer_linhas=REFAZER_LINHAS,
+                       intervalo=INTERVALO_PACIENTES,
                        offset_corte_mm=OFFSET_CORTE_MM, protrusao_min_mm=PROTRUSAO_MIN_MM,
                        salvar_ct=SALVAR_CT, mascarar_ct=MASCARAR_CT,
                        parametros_simulador=PARAMETROS_SIMULADOR,
