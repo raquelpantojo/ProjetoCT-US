@@ -45,6 +45,10 @@ import os
 import sys
 import time
 import datetime
+import glob
+import json
+import re
+import traceback
 import numpy as np
 import scipy.ndimage as ndimage
 import SimpleITK as sitk
@@ -648,6 +652,139 @@ def escrever_serie_dicom(vol, origem, espacamento, tags_base, pasta, descricao, 
 
 
 # ====================================================================== #
+# Varias pastas (P1, P2, ... cada uma com 2-CTAC... e 3-PET...)
+# ====================================================================== #
+ARQUIVO_LINHAS = "linhas_corte.json"
+PASTA_RESULTADO = "Imagens_cortadas"
+
+
+def salvar_linhas(linhas, arquivo):
+    os.makedirs(os.path.dirname(arquivo), exist_ok=True)
+    with open(arquivo, "w", encoding="utf-8") as f:
+        json.dump(linhas, f, indent=2)
+
+
+def ler_linhas(arquivo):
+    with open(arquivo, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def ordem_natural(nome):
+    """P2 antes de P10."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", nome)]
+
+
+def achar_series(pasta_paciente):
+    """Devolve (pasta da TC '2-CTAC...', pasta do PET '3-PET...' ou None)."""
+    subs = [d for d in sorted(os.listdir(pasta_paciente), key=ordem_natural)
+            if os.path.isdir(os.path.join(pasta_paciente, d))]
+    ct = [d for d in subs if d.upper().startswith("2-CTAC")] or [d for d in subs if "CTAC" in d.upper()]
+    pet = [d for d in subs if d.upper().startswith("3-PET")] or [d for d in subs if "PET" in d.upper()]
+    if not ct:
+        raise FileNotFoundError(f"nenhuma pasta '2-CTAC...' em {pasta_paciente}")
+    if len(ct) > 1 or len(pet) > 1:
+        print(f"   ATENCAO: mais de uma serie encontrada, usando {ct[0]}" + (f" e {pet[0]}" if pet else ""))
+    return os.path.join(pasta_paciente, ct[0]), (os.path.join(pasta_paciente, pet[0]) if pet else None)
+
+
+def desenhar_linhas_paciente(caminho_ct, pasta_saida, fatia_referencia_corte=None, protrusao_min_mm=10.0):
+    """So o corte: le a TC, o usuario desenha as retas, grava linhas_corte.json e a figura de conferencia."""
+    img, vol, _ = carregar_serie(caminho_ct)
+    spacing = img.GetSpacing()
+    corpo = SimuladorKutter.mascara_corpo(vol)
+    k_ref = fatia_referencia_corte if fatia_referencia_corte is not None else fatia_referencia(corpo)
+    linhas = escolher_linhas_desenho(vol, corpo, spacing, k_ref)
+    salvar_linhas(linhas, os.path.join(pasta_saida, ARQUIVO_LINHAS))
+    sep = separar_mamas_linhas(vol, corpo, spacing, linhas, protrusao_min_mm)
+    k_fig = int(np.argmax([sep["mascaras"][l].sum(axis=(1, 2)) for l in LADOS], axis=1).mean())
+    figura_separacao(vol, sep, spacing, k_fig, os.path.join(pasta_saida, "separacao_mamas.png"), False)
+    for lado in LADOS:
+        f = sep["fatias"][lado]
+        print(f"   -> {lado.replace('_', ' ')}: fatias {f[0]} a {f[-1]}, "
+              f"volume {sep['mascaras'][lado].sum() * np.prod(spacing) / 1000:.0f} cm3")
+    return linhas
+
+
+def processar_lote(pasta_raiz, etapa="tudo", prefixo_paciente="P", pular_prontos=True,
+                   refazer_linhas=False, **kw):
+    """
+    Roda todas as pastas de paciente (P1, P2, ..., ordem natural) dentro de pasta_raiz.
+    Cada paciente tem uma pasta '2-CTAC...' (TC) e, se houver, '3-PET...'. O resultado vai para
+    <pasta do paciente>/Imagens_cortadas, junto com linhas_corte.json (as retas desenhadas).
+
+    etapa = "desenhar": so abre as janelas e grava as retas de todos (rapido, precisa do usuario);
+            "simular" : so simula quem ja tem linhas_corte.json (pode rodar sozinho, sem ninguem);
+            "tudo"    : para cada paciente, desenha (se ainda nao tiver as retas) e simula.
+    pular_prontos : nao simula de novo quem ja tem Imagens_cortadas/resultado_mamas.png
+    refazer_linhas: desenha de novo mesmo quem ja tem linhas_corte.json
+    kw: os demais argumentos de processar (parametros_simulador, salvar_ct, ...).
+    """
+    pacientes = sorted([d for d in os.listdir(pasta_raiz)
+                        if os.path.isdir(os.path.join(pasta_raiz, d))
+                        and re.fullmatch(re.escape(prefixo_paciente) + r"\d+", d, flags=re.IGNORECASE)],
+                       key=ordem_natural)
+    print(f"{len(pacientes)} pastas de paciente em {pasta_raiz} (etapa: {etapa})")
+    if not pacientes:
+        return []
+    kw = dict(kw, confirmar=False, mostrar_figuras=False)    # em lote nao para para perguntar
+    log = []
+    t_ini = time.time()
+    for i, nome in enumerate(pacientes, 1):
+        pasta_p = os.path.join(pasta_raiz, nome)
+        pasta_saida = os.path.join(pasta_p, PASTA_RESULTADO)
+        arq_linhas = os.path.join(pasta_saida, ARQUIVO_LINHAS)
+        print("\n" + "=" * 70 + f"\n[{i}/{len(pacientes)}] {nome}\n" + "=" * 70)
+        t0 = time.time()
+        situacao, obs = "ok", ""
+        try:
+            caminho_ct, pasta_pet = achar_series(pasta_p)
+            print(f"   TC : {os.path.basename(caminho_ct)}\n   PET: {os.path.basename(pasta_pet) if pasta_pet else '(nao encontrado)'}")
+            tem_linhas = os.path.isfile(arq_linhas) and not refazer_linhas
+            pronto = os.path.isfile(os.path.join(pasta_saida, "resultado_mamas.png"))
+
+            if etapa == "desenhar":
+                if tem_linhas:
+                    situacao, obs = "pulado", "ja tinha linhas_corte.json"
+                else:
+                    desenhar_linhas_paciente(caminho_ct, pasta_saida, kw.get("fatia_referencia_corte"),
+                                             kw.get("protrusao_min_mm", 10.0))
+                    obs = "retas gravadas"
+            else:
+                if pular_prontos and pronto and tem_linhas:
+                    situacao, obs = "pulado", "ja simulado"
+                elif etapa == "simular" and not tem_linhas:
+                    situacao, obs = "pulado", "sem linhas_corte.json (rode a etapa 'desenhar')"
+                else:
+                    modo = dict(modo_corte="manual", linhas_corte=ler_linhas(arq_linhas)) if tem_linhas \
+                        else dict(modo_corte="desenhar", linhas_corte=None)
+                    r = processar(caminho_ct, pasta_saida, pasta_pet=pasta_pet, **dict(kw, **modo))
+                    obs = "simulado" if r is not None else "interrompido"
+        except KeyboardInterrupt:
+            print("\nInterrompido pelo usuario (Ctrl+C).")
+            log.append((nome, "interrompido", "Ctrl+C", 0.0))
+            break
+        except Exception as e:
+            situacao, obs = "ERRO", f"{type(e).__name__}: {e}"
+            print(f"   ERRO em {nome}: {obs}")
+            traceback.print_exc()
+        finally:
+            plt.close("all")
+        dt = time.time() - t0
+        log.append((nome, situacao, obs, dt))
+        print(f"   -> {nome}: {situacao} ({obs}) em {dt / 60:.1f} min")
+
+    arq_log = os.path.join(pasta_raiz, f"log_lote_{etapa}_{datetime.datetime.now():%Y%m%d_%H%M}.csv")
+    with open(arq_log, "w", encoding="utf-8") as f:
+        f.write("paciente;situacao;observacao;minutos\n")
+        for nome, sit, obs, dt in log:
+            f.write(f"{nome};{sit};{obs.replace(';', ',')};{dt / 60:.1f}\n")
+    n = {k: sum(1 for x in log if x[1] == k) for k in ("ok", "pulado", "ERRO")}
+    print(f"\nFim: {n['ok']} ok, {n['pulado']} pulados, {n['ERRO']} com erro, "
+          f"{(time.time() - t_ini) / 60:.0f} min no total. Resumo: {arq_log}")
+    return log
+
+
+# ====================================================================== #
 # Programa principal
 # ====================================================================== #
 def processar(caminho_serie, pasta_saida, offset_corte_mm=10.0, protrusao_min_mm=10.0,
@@ -675,6 +812,7 @@ def processar(caminho_serie, pasta_saida, offset_corte_mm=10.0, protrusao_min_mm
         elif not linhas_corte:
             raise ValueError("MODO_CORTE = 'manual' precisa de LINHAS_CORTE.")
         sep = separar_mamas_linhas(vol, corpo, spacing, linhas_corte, protrusao_min_mm)
+        salvar_linhas(linhas_corte, os.path.join(pasta_saida, ARQUIVO_LINHAS))
     else:
         sep = separar_mamas(vol, corpo, spacing, offset_corte_mm, protrusao_min_mm, meio_coluna)
     for lado in LADOS:
@@ -806,8 +944,23 @@ if __name__ == "__main__":
     PASTA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 
     # ------------------------- CONFIGURACAO -------------------------
-    CAMINHO_SERIE = os.path.join(PASTA_SCRIPT, "2-CTAC-14691")   # serie CTAC do QIN-BREAST
-    PASTA_SAIDA = os.path.join(PASTA_SCRIPT, "saida_US_mamas")
+    # EXECUCAO
+    #   "lote" : roda todas as pastas P1, P2, ... dentro de PASTA_RAIZ. Em cada uma procura a TC
+    #            (2-CTAC...) e o PET (3-PET...) e grava o resultado em P.../Imagens_cortadas.
+    #   "unico": roda uma serie so (CAMINHO_SERIE / PASTA_PET abaixo).
+    EXECUCAO = "lote"
+    PASTA_RAIZ = PASTA_SCRIPT       # pasta que contem P1, P2, ..., P110
+    PREFIXO_PACIENTE = "P"          # nome das pastas de paciente: P + numero
+    # ETAPA (so no lote)
+    #   "desenhar": abre as janelas e grava as retas de todos os pacientes, sem simular (rapido).
+    #   "simular" : simula todos que ja tem as retas gravadas - pode deixar rodando sozinho.
+    #   "tudo"    : paciente por paciente, desenha (se ainda nao tiver as retas) e simula.
+    ETAPA = "tudo"
+    PULAR_PRONTOS = True            # nao simula de novo quem ja tem Imagens_cortadas/resultado_mamas.png
+    REFAZER_LINHAS = False          # True = desenha de novo mesmo quem ja tem linhas_corte.json
+
+    CAMINHO_SERIE = os.path.join(PASTA_SCRIPT, "2-CTAC-14691")   # (unico) serie CTAC
+    PASTA_SAIDA = os.path.join(PASTA_SCRIPT, PASTA_RESULTADO)     # (unico) pasta de saida
     # CORTE DAS MAMAS
     #   "desenhar"  : em cada mama o usuario DESENHA as retas (clica, arrasta e solta):
     #                 no corte axial, a reta vertical (limite medial) e a reta de corte inclinada
@@ -841,14 +994,23 @@ if __name__ == "__main__":
         normalizar_pico_reflexao=True,     # reflexoes com pico preservado (correcao)
         suavizacao_ct_z_mm=1.5,            # TC suavizada para calcular Z (sem reflexoes do ruido)
     )
-    # Inclusao a partir do PET do mesmo estudo (None = sem inclusao)
-    PASTA_PET = os.path.join(PASTA_SCRIPT, "3-PET AC 3DWB-52072")
+    # Inclusao a partir do PET do mesmo estudo (no lote a pasta 3-PET... e achada sozinha)
+    PASTA_PET = os.path.join(PASTA_SCRIPT, "3-PET AC 3DWB-52072")   # (unico)
     ECOGENICIDADE_INCLUSAO = 0.1   # mapa de espalhamento na lesao (gordura ~0.2, glandula ~1): hipoecoica
     FRACAO_SUV = 0.40              # limiar de segmentacao: 40% do SUVmax
     SUV_MINIMO = 2.5               # abaixo disso considera que a mama nao tem inclusao
     # ----------------------------------------------------------------
 
-    processar(CAMINHO_SERIE, PASTA_SAIDA, OFFSET_CORTE_MM, PROTRUSAO_MIN_MM, MEIO_COLUNA,
-              SALVAR_CT, MASCARAR_CT, CONFIRMAR, MOSTRAR_FIGURAS, PARAMETROS_SIMULADOR,
-              PASTA_PET if os.path.isdir(PASTA_PET) else None, ECOGENICIDADE_INCLUSAO, FRACAO_SUV, SUV_MINIMO,
-              modo_corte=MODO_CORTE, linhas_corte=LINHAS_CORTE, fatia_referencia_corte=FATIA_REFERENCIA_CORTE)
+    if EXECUCAO == "lote":
+        processar_lote(PASTA_RAIZ, etapa=ETAPA, prefixo_paciente=PREFIXO_PACIENTE,
+                       pular_prontos=PULAR_PRONTOS, refazer_linhas=REFAZER_LINHAS,
+                       offset_corte_mm=OFFSET_CORTE_MM, protrusao_min_mm=PROTRUSAO_MIN_MM,
+                       salvar_ct=SALVAR_CT, mascarar_ct=MASCARAR_CT,
+                       parametros_simulador=PARAMETROS_SIMULADOR,
+                       ecogenicidade_inclusao=ECOGENICIDADE_INCLUSAO, fracao_suv=FRACAO_SUV,
+                       suv_minimo=SUV_MINIMO, fatia_referencia_corte=FATIA_REFERENCIA_CORTE)
+    else:
+        processar(CAMINHO_SERIE, PASTA_SAIDA, OFFSET_CORTE_MM, PROTRUSAO_MIN_MM, MEIO_COLUNA,
+                  SALVAR_CT, MASCARAR_CT, CONFIRMAR, MOSTRAR_FIGURAS, PARAMETROS_SIMULADOR,
+                  PASTA_PET if os.path.isdir(PASTA_PET) else None, ECOGENICIDADE_INCLUSAO, FRACAO_SUV, SUV_MINIMO,
+                  modo_corte=MODO_CORTE, linhas_corte=LINHAS_CORTE, fatia_referencia_corte=FATIA_REFERENCIA_CORTE)
