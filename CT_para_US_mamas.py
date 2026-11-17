@@ -17,14 +17,13 @@ Pipeline completo TC -> ultrassom simulado para exames de mama (QIN-BREAST, decu
        Z linear no HU (ar/osso segmentados) -> alpha_R, alpha_T -> I_i recursivo -> reflexao
        lambertiana com abertura ativa (Hann) -> espalhamento (Poisson + PSF + envelope, alongado)
        -> I_us = (G_s1 * I_r + alpha G_s2 * alpha_T) I_s -> compressao log [Eq. 7].
-     O TRANSDUTOR e posicionado pelo usuario (ver TRANSDUTORES no __main__): sonda linear no
-     plano axial, com centro da face, angulo do feixe, largura e profundidade. A posicao pode
-     ser clicada na TC ou digitada em mm; sem posicao, a sonda vai para o mamilo, com o feixe
-     de anterior para posterior. A sonda fica fixa e a varredura e feita fatia a fatia na
-     direcao S-I (como num sistema motorizado), em agua.
-  6. Grava, para cada transdutor e cada mama, novas series DICOM:
-       saida/<mama>/US_<nome>/ -> ultrassom simulado no plano da sonda (8 bits, 0 = -faixa
-                                  dinamica, 255 = 0 dB), com a orientacao da sonda no DICOM
+     Phantom de US: a mama inteira e simulada como se fosse varrida de cima, com o feixe no
+     sentido anterior -> posterior (do mamilo para a parede toracica), sem posicao de
+     transdutor e sem limite de profundidade (a imagem cobre todo o recorte da mama).
+     A fisica e calculada com todo o tecido dentro do recorte (sem interfaces artificiais no
+     corte); so no fim os pixels fora da mama sao zerados.
+  6. Grava, para cada mama, novas series DICOM:
+       saida/<mama>/US/  -> ultrassom simulado (8 bits, 0 = -faixa dinamica, 255 = 0 dB)
        saida/<mama>/CT/  -> TC recortada (HU, int16; fora da mama = -1000 se MASCARAR_CT)
      As series ficam no mesmo estudo e no mesmo Frame of Reference da TC original, com posicao
      e orientacao (ImagePositionPatient / ImageOrientationPatient) corretas: em visualizadores
@@ -32,11 +31,6 @@ Pipeline completo TC -> ultrassom simulado para exames de mama (QIN-BREAST, decu
 
 Convencao de lados: em LPS a coluna cresce para a ESQUERDA do paciente. Na tela (convencao
 radiologica) a mama direita aparece a esquerda da imagem.
-
-Convencao do transdutor (mesmas coordenadas das figuras): x (mm) cresce para a direita da tela
-(esquerda da paciente) e y (mm) para baixo (posterior), a partir do canto da imagem.
-centro_mm = (x, y) do centro da face da sonda; angulo_graus = 0 -> feixe para +y (anterior ->
-posterior); angulo > 0 gira o feixe para +x (para a esquerda da paciente).
 
 Inclusoes (lesoes): se a pasta do PET do mesmo estudo PET/CT for informada, o FDG localiza o
 tumor (SUVmax >= SUV_MINIMO; segmentacao a 40% do SUVmax). A lesao e somada a mascara da mama
@@ -57,7 +51,7 @@ import SimpleITK as sitk
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from TransformCTUS_kutter import SimuladorKutter, gradiente_deriche_3d  # noqa: E402
+from TransformCTUS_kutter import SimuladorKutter  # noqa: E402
 
 LADOS = ("mama_direita", "mama_esquerda")
 
@@ -149,8 +143,124 @@ def separar_mamas(vol, corpo, spacing, offset_corte_mm=10.0, protrusao_min_mm=10
         if fatias[lado].size == 0:
             raise RuntimeError(f"Nao foi possivel encontrar a {lado.replace('_', ' ')}. "
                                "Ajuste PROTRUSAO_MIN_MM ou MEIO_COLUNA.")
-    return dict(meio=meio, corte=corte, mascaras=mascaras, fatias=fatias,
+    return dict(meio=meio, meio_lado={l: meio for l in LADOS}, corte=corte, mascaras=mascaras, fatias=fatias,
                 mamilos={"mama_direita": mamilo_dir, "mama_esquerda": mamilo_esq}, perfil=F)
+
+
+def fatia_referencia(corpo):
+    """Fatia em que o corpo chega mais a frente (em geral a do mamilo da mama mais pendente)."""
+    f = perfil_anterior(corpo)
+    return int(np.argmin(np.where(np.isfinite(f), f, np.inf).min(axis=1)))
+
+
+def escolher_linhas_clique(vol, corpo, spacing, k_ref):
+    """
+    Para cada mama, tres cliques na fatia k_ref:
+      1) a linha VERTICAL (limite medial, entre as mamas);
+      2) e 3) dois pontos da linha de CORTE posterior, que pode ser inclinada (siga a parede
+         toracica, da linha media para a lateral). Tudo que estiver a frente da linha (acima, na
+         tela) e do lado da mama entra no recorte.
+    Depois, numa vista sagital (de lado) que passa pela mama, mais dois cliques:
+      4) e 5) limite SUPERIOR e INFERIOR da mama (a linha de corte e a mesma em todas as fatias,
+         entao sem esses limites o abdome e o pescoco tambem passariam da linha).
+    Devolve {lado: dict(x_medial_mm=..., linha_mm=((x1, y1), (x2, y2)), z_mm=(z_inf, z_sup))}.
+    """
+    dx, dy, _ = spacing
+    ny, nx = vol.shape[1:]
+    ys, xs = np.where(corpo[k_ref])
+    linhas = {}
+    nomes = {"mama_direita": "MAMA DIREITA (lado esquerdo da tela)",
+             "mama_esquerda": "MAMA ESQUERDA (lado direito da tela)"}
+    for lado in LADOS:
+        fig, ax = plt.subplots(figsize=(11, 7))
+        ax.imshow(vol[k_ref], cmap="bone", vmin=-200, vmax=300, extent=[0, nx * dx, ny * dy, 0])
+        for l_ant, L in linhas.items():
+            (x1, y1), (x2, y2) = L["linha_mm"]
+            ax.axvline(L["x_medial_mm"], color="yellow", ls="--", lw=1)
+            ax.plot([x1, x2], [y1, y2], color="orange", lw=2)
+        ax.set_ylim(min(ys.min() * dy + 0.55 * (ys.max() - ys.min()) * dy, ny * dy), max(ys.min() * dy - 20, 0))
+        ax.set_xlim(max(xs.min() * dx - 20, 0), min(xs.max() * dx + 20, nx * dx))
+        ax.set_xlabel("x (mm)"); ax.set_ylabel("y (mm)")
+        ax.set_title(f"{nomes[lado]} - fatia {k_ref}\nClique 1: linha VERTICAL (limite medial)   "
+                     f"Cliques 2 e 3: dois pontos da linha de CORTE (pode ser inclinada)",
+                     fontsize=10, color="darkred")
+        pts = plt.ginput(3, timeout=0)
+        plt.close(fig)
+        if len(pts) < 3:
+            raise RuntimeError("Sao necessarios tres cliques por mama.")
+        (xm, _), p1, p2 = pts
+        if abs(p2[0] - p1[0]) < 1e-6:
+            raise RuntimeError("A linha de corte nao pode ser vertical: clique dois pontos com x diferentes.")
+        L = dict(x_medial_mm=round(float(xm), 1),
+                 linha_mm=((round(float(p1[0]), 1), round(float(p1[1]), 1)),
+                           (round(float(p2[0]), 1), round(float(p2[1]), 1))))
+
+        # vista sagital pela coluna em que a mama mais passa da linha (na fatia de referencia)
+        (x1, y1), (x2, y2) = L["linha_mm"]
+        X = (np.arange(nx) + 0.5) * dx
+        lado_col = X < L["x_medial_mm"] if lado == "mama_direita" else X >= L["x_medial_mm"]
+        y_lin = y1 + (X - x1) * (y2 - y1) / (x2 - x1)
+        frente = np.where(corpo[k_ref].any(axis=0), y_lin - (np.argmax(corpo[k_ref], axis=0) + 0.5) * dy, -np.inf)
+        col = int(np.argmax(np.where(lado_col, frente, -np.inf)))
+        nz, dz = vol.shape[0], spacing[2]
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(vol[:, :, col], cmap="bone", vmin=-200, vmax=300, origin="lower",
+                  extent=[0, ny * dy, 0, nz * dz], aspect="equal")
+        ax.axvline(y_lin[col], color="orange", lw=2, label="linha de corte nesta coluna")
+        ax.axhline((k_ref + 0.5) * dz, color="yellow", ls=":", lw=1, label=f"fatia {k_ref}")
+        ax.set_xlim(max(ys.min() * dy - 20, 0), min(y_lin[col] + 80, ny * dy))
+        ax.set_xlabel("y (mm) -> posterior"); ax.set_ylabel("z (mm) -> superior")
+        ax.legend(loc="lower right", fontsize=8)
+        ax.set_title(f"{nomes[lado]} - vista sagital (x = {X[col]:.0f} mm)\n"
+                     "Clique 4: limite SUPERIOR da mama   Clique 5: limite INFERIOR", fontsize=10, color="darkred")
+        pts = plt.ginput(2, timeout=0)
+        plt.close(fig)
+        if len(pts) < 2:
+            raise RuntimeError("Sao necessarios dois cliques (superior e inferior) na vista sagital.")
+        za, zb = sorted(float(p[1]) for p in pts)
+        L["z_mm"] = (round(za, 1), round(zb, 1))
+        linhas[lado] = L
+    return linhas
+
+
+def separar_mamas_linhas(vol, corpo, spacing, linhas, protrusao_min_mm=10.0):
+    """
+    Separa as mamas com as linhas do usuario (as mesmas em todas as fatias):
+      mama = corpo  E  lado certo da linha vertical  E  a frente (acima) da linha de corte.
+    Entram so as fatias em que a mama passa pelo menos protrusao_min_mm a frente da linha.
+    Devolve o mesmo dicionario de separar_mamas.
+    """
+    dx, dy, _ = spacing
+    nz, ny, nx = corpo.shape
+    X = (np.arange(nx) + 0.5) * dx                            # mm, centro do pixel
+    Y = (np.arange(ny) + 0.5) * dy
+    mascaras, fatias, meio_lado = {}, {}, {}
+    for lado in LADOS:
+        L = linhas[lado]
+        (x1, y1), (x2, y2) = L["linha_mm"]
+        y_linha = y1 + (X - x1) * (y2 - y1) / (x2 - x1)       # y da linha em cada coluna (mm)
+        dist = y_linha[None, :] - Y[:, None]                  # > 0: a frente da linha (mm, vertical)
+        lado_col = X < L["x_medial_mm"] if lado == "mama_direita" else X >= L["x_medial_mm"]
+        regiao = (dist > 0) & lado_col[None, :]               # (Y, X), igual em todas as fatias
+        m = corpo & regiao[None]
+        if L.get("z_mm") is not None:                          # limites superior/inferior
+            zc = (np.arange(nz) + 0.5) * spacing[2]
+            m[(zc < L["z_mm"][0]) | (zc > L["z_mm"][1])] = False
+        prot = np.where(m, dist[None], 0.0).max(axis=(1, 2))  # quanto a mama passa da linha, por fatia
+        m[prot < protrusao_min_mm] = False
+        rot, n = ndimage.label(m)
+        if n > 1:
+            tam = ndimage.sum_labels(np.ones_like(rot), rot, index=np.arange(1, n + 1))
+            m = rot == (np.argmax(tam) + 1)
+        mascaras[lado] = m
+        fatias[lado] = np.where(m.any(axis=(1, 2)))[0]
+        meio_lado[lado] = int(round(L["x_medial_mm"] / dx - 0.5)) + (0 if lado == "mama_direita" else 1)
+        if fatias[lado].size == 0:
+            raise RuntimeError(f"Nenhuma fatia da {lado.replace('_', ' ')} passa {protrusao_min_mm} mm da linha de "
+                               "corte. Confira as linhas ou reduza PROTRUSAO_MIN_MM.")
+    meio = int(round(np.mean(list(meio_lado.values()))))
+    return dict(meio=meio, meio_lado=meio_lado, corte=None, linhas=linhas, mascaras=mascaras, fatias=fatias,
+                perfil=np.where(np.isfinite(perfil_anterior(corpo)), perfil_anterior(corpo), ny).min(axis=0))
 
 
 def caixa_da_mama(mascara, spacing, folga_mm=3.0, margem_mm=2.0, meio=None, lado=None):
@@ -181,14 +291,23 @@ def figura_separacao(vol, sep, spacing, k_meio, arquivo, mostrar):
         m = sep["mascaras"][lado][k_meio]
         if m.any():
             ax[0].contour(m, levels=[0.5], colors=cores[lado], linewidths=1.5, extent=[0, nx * dx, 0, ny * dy])
-    ax[0].axvline((sep["meio"] + 0.5) * dx, color="yellow", ls="--", lw=1, label="linha media")
-    if np.isfinite(sep["corte"][k_meio]):
-        ax[0].axhline((sep["corte"][k_meio] + 0.5) * dy, color="orange", ls=":", lw=1, label="limite posterior")
+    if sep.get("linhas"):
+        for i, (lado, L) in enumerate(sep["linhas"].items()):
+            (x1, y1), (x2, y2) = L["linha_mm"]
+            xa = np.array([0.0, L["x_medial_mm"]]) if lado == "mama_direita" else np.array([L["x_medial_mm"], nx * dx])
+            ya = y1 + (xa - x1) * (y2 - y1) / (x2 - x1)
+            ax[0].axvline(L["x_medial_mm"], color="yellow", ls="--", lw=1, label="limite medial" if i == 0 else None)
+            ax[0].plot(xa, ya, color="orange", lw=1.5, label="linha de corte" if i == 0 else None)
+            ax[0].plot([x1, x2], [y1, y2], "o", color="orange", ms=4)
+    else:
+        ax[0].axvline((sep["meio"] + 0.5) * dx, color="yellow", ls="--", lw=1, label="linha media")
+        if np.isfinite(sep["corte"][k_meio]):
+            ax[0].axhline((sep["corte"][k_meio] + 0.5) * dy, color="orange", ls=":", lw=1, label="limite posterior")
     ax[0].set_title(f"Fatia {k_meio}: vermelho = mama direita, ciano = mama esquerda", fontsize=11)
     ax[0].set_xlabel("x (mm) -> esquerda do paciente"); ax[0].set_ylabel("y (mm) -> posterior")
     ax[0].legend(loc="lower right", fontsize=9)
-    ys = [y for y in (sep["perfil"].min() - 15, np.nanmax(np.where(np.isfinite(sep["corte"]), sep["corte"], np.nan)) + 25)]
-    ax[0].set_ylim(min(ys[1] * dy, ny * dy), max(ys[0] * dy, 0))
+    fundo = max(np.where(sep["mascaras"][l].any(axis=(0, 2)))[0].max() for l in LADOS)
+    ax[0].set_ylim(min((fundo + 25) * dy, ny * dy), max((sep["perfil"].min() - 15) * dy, 0))
 
     # projecao frontal (coronal) da extensao das mamas
     proj = np.zeros(vol.shape[::2], dtype=np.int8)            # (Z, X)
@@ -196,7 +315,13 @@ def figura_separacao(vol, sep, spacing, k_meio, arquivo, mostrar):
         proj[sep["mascaras"][lado].any(axis=1)] = i
     ax[1].imshow(proj, cmap="viridis", origin="lower", aspect="equal",
                  extent=[0, nx * dx, 0, vol.shape[0] * spacing[2]])
-    ax[1].axvline((sep["meio"] + 0.5) * dx, color="yellow", ls="--", lw=1)
+    for l in LADOS:
+        ax[1].axvline((sep["meio_lado"][l] + 0.5) * dx, color="yellow", ls="--", lw=1)
+        L = (sep.get("linhas") or {}).get(l)
+        if L and L.get("z_mm") is not None:
+            xa = (0, L["x_medial_mm"]) if l == "mama_direita" else (L["x_medial_mm"], nx * dx)
+            for z in L["z_mm"]:
+                ax[1].plot(xa, (z, z), color="orange", lw=1.5)
     ax[1].set_title("Projecao coronal: 1 = direita, 2 = esquerda", fontsize=11)
     ax[1].set_xlabel("x (mm)"); ax[1].set_ylabel("z (mm) -> superior")
     plt.tight_layout()
@@ -277,113 +402,37 @@ def segmentar_inclusoes(suv, mascaras, corpo, spacing, fracao_max=0.40, suv_mini
 # ====================================================================== #
 # 5. Simulacao de uma mama
 # ====================================================================== #
-def vetores_transdutor(angulo_graus):
-    """Direcao do feixe d e direcao lateral u (unitarios, em (x, y) da imagem)."""
-    a = np.deg2rad(angulo_graus)
-    d = np.array([np.sin(a), np.cos(a)])          # profundidade
-    u = np.array([np.cos(a), -np.sin(a)])         # lateral (u x d = +z: orientacao direita)
-    return u, d
-
-
-def posicao_automatica(mascara, k, spacing, folga_mm=3.0):
-    """Centro da sonda sobre o ponto mais anterior (mamilo) da mama na fatia k, com folga em agua."""
+def simular_mama(vol_c, corpo_c, mascara_c, spacing, sim, mascarar_saida=True, rotulo="",
+                 inclusao_c=None, ecogenicidade_inclusao=0.1):
+    """
+    Simula o volume recortado de uma mama. Devolve (vol_db [Z, linhas, colunas] em [-DR, 0],
+    prof (mm, a partir do topo do recorte), xs (mm, a partir da borda esquerda do recorte)).
+    """
+    nz, ny, nx = vol_c.shape
     dx, dy, _ = spacing
-    ys, xs = np.where(mascara[k])
-    i = np.argmin(ys)
-    return ((xs[i] + 0.5) * dx, (ys[i] + 0.5) * dy - folga_mm)
-
-
-def escolher_transdutor_clique(vol, mascara, k, spacing, largura_mm, profundidade_mm, titulo=""):
-    """
-    Mostra a fatia k e pede dois cliques: 1) centro da face do transdutor (na agua, junto a pele);
-    2) um ponto na direcao do feixe (dentro da mama). Devolve (centro_mm, angulo_graus).
-    """
-    dx, dy, _ = spacing
-    ny, nx = vol.shape[1:]
-    ys, xs = np.where(mascara[k])
-    fig, ax = plt.subplots(figsize=(9, 8))
-    ax.imshow(vol[k], cmap="bone", vmin=-200, vmax=300, extent=[0, nx * dx, ny * dy, 0])
-    ax.contour(mascara[k], [0.5], colors="cyan", linewidths=1, extent=[0, nx * dx, 0, ny * dy])
-    m = 40.0
-    ax.set_xlim(xs.min() * dx - m, xs.max() * dx + m)
-    ax.set_ylim(ys.max() * dy + m, ys.min() * dy - m)
-    ax.set_title(f"{titulo} - fatia {k}\nClique 1: centro da face do transdutor (na agua, junto a pele)\n"
-                 "Clique 2: um ponto na direcao do feixe (dentro da mama)", fontsize=10, color="darkred")
-    pts = plt.ginput(2, timeout=0)
-    plt.close(fig)
-    if len(pts) < 2:
-        raise RuntimeError("Sao necessarios dois cliques para posicionar o transdutor.")
-    (x0, y0), (x1, y1) = pts
-    angulo = float(np.rad2deg(np.arctan2(x1 - x0, y1 - y0)))
-    return (float(x0), float(y0)), angulo
-
-
-def coordenadas_transdutor(spacing, centro_mm, angulo_graus, largura_mm, profundidade_mm, dz, dx_lat):
-    """
-    Grade do plano da sonda: ponto(s, a) = centro + a*u + s*d, s = profundidade, a = lateral.
-    Devolve (coords [2, ns, na] em indices (linha, coluna) da TC, prof, lat, u, d).
-    """
-    dx, dy, _ = spacing
-    u, d = vetores_transdutor(angulo_graus)
-    ns = int(round(profundidade_mm / dz))
-    na = int(round(largura_mm / dx_lat))
-    prof = np.arange(ns) * dz
-    lat = (np.arange(na) - (na - 1) / 2.0) * dx_lat
-    S, A = np.meshgrid(prof, lat, indexing="ij")
-    X = centro_mm[0] + A * u[0] + S * d[0]
-    Y = centro_mm[1] + A * u[1] + S * d[1]
-    return np.stack([Y / dy - 0.5, X / dx - 0.5]), prof, lat, u, d
-
-
-def simular_transdutor(vol, corpo, mascara, inclusao, spacing, sim, centro_mm, angulo_graus,
-                       largura_mm, profundidade_mm, fatias, limitar_a_mama=False,
-                       ecogenicidade_inclusao=0.1, rotulo=""):
-    """
-    Simula a imagem da sonda posicionada pelo usuario em cada fatia de 'fatias'.
-    A fisica usa toda a anatomia no campo de visao (parede toracica, costelas...);
-    com limitar_a_mama=True, os pixels fora da mama sao zerados no fim.
-    Devolve (vol_db [fatias, prof, lateral], prof, lat, u, d).
-    """
-    dx, dy, dz = spacing
-    k0, k1 = int(fatias[0]), int(fatias[-1]) + 1
-    coords, prof, lat, u, d = coordenadas_transdutor(spacing, centro_mm, angulo_graus, largura_mm,
-                                                     profundidade_mm, sim.dz_fino, sim.dx_fino)
-    # recorte da TC que contem o campo de visao (+ margem), para acelerar
-    mg = 8
-    r0 = max(int(np.floor(coords[0].min())) - mg, 0); r1 = min(int(np.ceil(coords[0].max())) + mg, vol.shape[1])
-    c0 = max(int(np.floor(coords[1].min())) - mg, 0); c1 = min(int(np.ceil(coords[1].max())) + mg, vol.shape[2])
-    if r1 <= r0 or c1 <= c0:
-        raise ValueError("O campo de visao do transdutor esta fora da imagem.")
-    sl = (slice(k0, k1), slice(r0, r1), slice(c0, c1))
-    vol_c, corpo_c, masc_c = vol[sl], corpo[sl], mascara[sl]
-    coords_c = coords - np.array([r0, c0])[:, None, None]
-
     t0 = time.time()
-    _, m, _ = sim.preprocessar_volume(vol_c, corpo_c, spacing, roi_3d=masc_c.astype(np.float32))
-    if inclusao is not None and inclusao[sl].any():
-        # Inclusao (tumor): hipoecoica no mapa de espalhamento; a borda continua refletindo
-        # porque a impedancia vem do HU da TC.
-        m = np.where(inclusao[sl], np.float32(ecogenicidade_inclusao), m)
-    # termo lambertiano |r.n| com r = direcao do feixe da sonda (pode ser obliqua)
-    hu = np.where(corpo_c, vol_c, 0.0).astype(np.float32)
-    gz, gy, gx = gradiente_deriche_3d(hu, (dz, dy, dx), sim.escala_deriche_mm)
-    gmag = np.sqrt(gz ** 2 + gy ** 2 + gx ** 2)
-    rn = ((np.abs(gx * d[0] + gy * d[1]) / (gmag + 1e-6)) ** sim.p_lambert).astype(np.float32)
-
-    uns = np.ones(vol_c.shape[1:], np.float32)
+    rn, m, _ = sim.preprocessar_volume(vol_c, corpo_c, spacing, roi_3d=mascara_c.astype(np.float32))
+    if inclusao_c is not None and inclusao_c.any():
+        # Inclusao (tumor): hipoecoica. A TC nao distingue bem tumor de glandula (HU parecidos);
+        # o PET define a regiao e aqui ela recebe ecogenicidade propria no mapa de espalhamento.
+        # A borda continua com reflexao, porque a impedancia vem do HU da TC.
+        m = np.where(inclusao_c, np.float32(ecogenicidade_inclusao), m)
+    coords, prof, xs = sim.coordenadas_regiao(spacing, 0.0, nx * dx, 0.0, ny * dy)
+    uns = np.ones((ny, nx), np.float32)
     saida = None
-    for i in range(vol_c.shape[0]):
-        Ius, _, _ = sim.simular_fatia(vol_c[i], corpo_c[i], uns, rn[i], m[i], coords_c, spacing)
+    for k in range(nz):
+        Ius, _, _ = sim.simular_fatia(vol_c[k], corpo_c[k], uns, rn[k], m[k], coords, spacing)
         Ius = Ius[::2]
-        if limitar_a_mama:
-            dentro = ndimage.map_coordinates(masc_c[i].astype(np.float32), coords_c[:, ::2], order=1) > 0.5
+        if mascarar_saida:
+            dentro = ndimage.map_coordinates(mascara_c[k].astype(np.float32), coords[:, ::2], order=1) > 0.5
             Ius = np.where(dentro, Ius, 0.0)
         if saida is None:
-            saida = np.zeros((vol_c.shape[0],) + Ius.shape, np.float32)
-        saida[i] = Ius
-        print(f"\r   -> {rotulo}: fatia {i + 1}/{vol_c.shape[0]}", end="", flush=True)
+            saida = np.zeros((nz,) + Ius.shape, np.float32)
+        saida[k] = Ius
+        print(f"\r   -> {rotulo}: fatia {k + 1}/{nz}", end="", flush=True)
     print(f"  ({time.time() - t0:.0f} s)")
-    return sim.comprimir_log(saida), prof[::2], lat, u, d
+    vol_db = sim.comprimir_log(saida)
+    return vol_db, prof[::2], xs
 
 
 # ====================================================================== #
@@ -398,19 +447,16 @@ def novo_uid():
 
 
 def escrever_serie_dicom(vol, origem, espacamento, tags_base, pasta, descricao, modalidade,
-                         numero_serie, extras=None, direcao=None):
+                         numero_serie, extras=None):
     """
-    Grava vol [Z, Y, X] (uint8 ou int16) como uma serie DICOM, uma fatia por arquivo.
-    origem = centro do voxel [0, 0, 0] em mm (LPS). direcao = matriz 3x3 (colunas = direcoes
-    dos eixos X, Y, Z da imagem em LPS); None = identidade.
+    Grava vol [Z, Y, X] (uint8 ou int16) como uma serie DICOM, uma fatia por arquivo, com
+    orientacao LPS (identidade), origem = centro do voxel [0, 0, 0] em mm (x, y, z).
     """
     os.makedirs(pasta, exist_ok=True)
     img = sitk.GetImageFromArray(vol)
     img.SetSpacing([float(s) for s in espacamento])
     img.SetOrigin([float(o) for o in origem])
-    D = np.eye(3) if direcao is None else np.asarray(direcao, float)
-    img.SetDirection(tuple(D.ravel()))
-    orient = "\\".join(f"{v:.6f}" for v in list(D[:, 0]) + list(D[:, 1]))
+    img.SetDirection((1, 0, 0, 0, 1, 0, 0, 0, 1))
 
     agora = datetime.datetime.now()
     data, hora = agora.strftime("%Y%m%d"), agora.strftime("%H%M%S")
@@ -426,7 +472,7 @@ def escrever_serie_dicom(vol, origem, espacamento, tags_base, pasta, descricao, 
         ("0008|0008", "DERIVED\\SECONDARY"),
         ("0008|0021", data), ("0008|0031", hora),
         ("0008|0064", "WSD"),                            # Conversion Type: workstation
-        ("0020|0037", orient),                           # Image Orientation (Patient)
+        ("0020|0037", "1\\0\\0\\0\\1\\0"),               # Image Orientation (Patient): LPS
         ("0018|0050", f"{espacamento[2]:.4f}"),
         # Pixel Spacing explicito (linha\\coluna): sem isso a classe US grava 1 x 1 mm
         ("0028|0030", f"{espacamento[1]:.6f}\\{espacamento[0]:.6f}"),
@@ -456,8 +502,8 @@ def escrever_serie_dicom(vol, origem, espacamento, tags_base, pasta, descricao, 
 def processar(caminho_serie, pasta_saida, offset_corte_mm=10.0, protrusao_min_mm=10.0,
               meio_coluna=None, salvar_ct=True, mascarar_ct=True, confirmar=True,
               mostrar_figuras=True, parametros_simulador=None, pasta_pet=None,
-              ecogenicidade_inclusao=0.1, fracao_suv=0.40, suv_minimo=2.5, transdutores=None,
-              limitar_a_mama=False):
+              ecogenicidade_inclusao=0.1, fracao_suv=0.40, suv_minimo=2.5,
+              modo_corte="automatico", linhas_corte=None, fatia_referencia_corte=None):
     os.makedirs(pasta_saida, exist_ok=True)
     print("1. Lendo a serie DICOM e reorientando para LPS...")
     img, vol, tags = carregar_serie(caminho_serie)
@@ -469,12 +515,33 @@ def processar(caminho_serie, pasta_saida, offset_corte_mm=10.0, protrusao_min_mm
     corpo = SimuladorKutter.mascara_corpo(vol)
 
     print("3. Separando mama direita e esquerda...")
-    sep = separar_mamas(vol, corpo, spacing, offset_corte_mm, protrusao_min_mm, meio_coluna)
+    if modo_corte in ("clique", "manual"):
+        if modo_corte == "clique":
+            k_ref_corte = fatia_referencia_corte if fatia_referencia_corte is not None else fatia_referencia(corpo)
+            linhas_corte = escolher_linhas_clique(vol, corpo, spacing, k_ref_corte)
+            print(f"   -> linhas escolhidas na fatia {k_ref_corte}. Para repetir sem clicar, use no __main__:")
+            print(f"      MODO_CORTE = \"manual\"\n      LINHAS_CORTE = {linhas_corte}")
+        elif not linhas_corte:
+            raise ValueError("MODO_CORTE = 'manual' precisa de LINHAS_CORTE.")
+        sep = separar_mamas_linhas(vol, corpo, spacing, linhas_corte, protrusao_min_mm)
+    else:
+        sep = separar_mamas(vol, corpo, spacing, offset_corte_mm, protrusao_min_mm, meio_coluna)
     for lado in LADOS:
         f = sep["fatias"][lado]
         print(f"   -> {lado.replace('_', ' ')}: fatias {f[0]} a {f[-1]} ({f.size}), "
               f"volume {sep['mascaras'][lado].sum() * np.prod(spacing) / 1000:.0f} cm3")
-    print(f"   -> linha media na coluna {sep['meio']} (x = {(sep['meio'] + 0.5) * spacing[0]:.1f} mm do canto)")
+    if sep.get("linhas"):
+        for lado in LADOS:
+            L = sep["linhas"][lado]
+            (x1, y1), (x2, y2) = L["linha_mm"]
+            ang = np.degrees(np.arctan(abs(y2 - y1) / abs(x2 - x1)))
+            medial_mais_alto = (y1 if abs(x1 - L["x_medial_mm"]) < abs(x2 - L["x_medial_mm"]) else y2) < max(y1, y2)
+            print(f"   -> {lado.replace('_', ' ')}: limite medial x = {L['x_medial_mm']:.1f} mm, linha de corte de "
+                  f"({x1:.0f}, {y1:.0f}) a ({x2:.0f}, {y2:.0f}) mm ({ang:.0f} graus, "
+                  f"{'descendo para a lateral' if medial_mais_alto else 'subindo para a lateral'}), "
+                  f"fatias {sep['fatias'][lado][0]}-{sep['fatias'][lado][-1]}")
+    else:
+        print(f"   -> linha media na coluna {sep['meio']} (x = {(sep['meio'] + 0.5) * spacing[0]:.1f} mm do canto)")
     inclusoes = {lado: None for lado in LADOS}
     if pasta_pet:
         print("3b. Procurando inclusoes no PET (FDG)...")
@@ -490,7 +557,8 @@ def processar(caminho_serie, pasta_saida, offset_corte_mm=10.0, protrusao_min_mm
                   f"{100 * r_['dentro']:.0f}% dentro do recorte original")
             # a mama passa a incluir a lesao (+2 mm), mesmo que ela fique alem do limite posterior
             margem = ndimage.binary_dilation(inclusoes[lado], np.ones((1, 3, 3), bool), iterations=2) & corpo
-            lado_ok = (np.arange(vol.shape[2]) < sep["meio"]) if lado == "mama_direita" else (np.arange(vol.shape[2]) >= sep["meio"])
+            lado_ok = (np.arange(vol.shape[2]) < sep["meio_lado"][lado]) if lado == "mama_direita" \
+                else (np.arange(vol.shape[2]) >= sep["meio_lado"][lado])
             sep["mascaras"][lado] = sep["mascaras"][lado] | (margem & lado_ok[None, None, :])
             inclusoes[lado] &= lado_ok[None, None, :]
     k_ref = int(np.argmax([sep["mascaras"]["mama_direita"][k].sum() + sep["mascaras"]["mama_esquerda"][k].sum()
@@ -501,127 +569,80 @@ def processar(caminho_serie, pasta_saida, offset_corte_mm=10.0, protrusao_min_mm
     if confirmar:
         resp = input("   A separacao esta correta? [s/n]: ").strip().lower()
         if resp not in ("s", "sim", "y", ""):
-            print("   Ajuste OFFSET_CORTE_MM, PROTRUSAO_MIN_MM ou MEIO_COLUNA no inicio do __main__ e rode de novo.")
+            print("   Ajuste MODO_CORTE / LINHAS_CORTE (ou OFFSET_CORTE_MM, PROTRUSAO_MIN_MM, MEIO_COLUNA no modo\n"
+                  "   automatico) no inicio do __main__ e rode de novo.")
             return None
 
-    # ---------------- TC recortada e inclusao de cada mama (independe da sonda) ----------------
-    nomes = {"mama_direita": "direita", "mama_esquerda": "esquerda"}
+    resultados = {}
     for n_lado, lado in enumerate(LADOS):
-        if not (salvar_ct or inclusoes[lado] is not None):
-            continue
-        k0, k1, r0, r1, c0, c1 = caixa_da_mama(sep["mascaras"][lado], spacing, meio=sep["meio"], lado=lado)
+        print(f"4-6. {lado.replace('_', ' ').upper()}")
+        k0, k1, r0, r1, c0, c1 = caixa_da_mama(sep["mascaras"][lado], spacing, meio=sep["meio_lado"][lado], lado=lado)
+        vol_c = vol[k0:k1, r0:r1, c0:c1]
+        corpo_c = corpo[k0:k1, r0:r1, c0:c1]
+        masc_c = sep["mascaras"][lado][k0:k1, r0:r1, c0:c1]
+        incl_c = None if inclusoes[lado] is None else inclusoes[lado][k0:k1, r0:r1, c0:c1]
         img_c = img[c0:c1, r0:r1, k0:k1]                          # mantem a geometria fisica
+        print(f"   -> recorte: {vol_c.shape} voxels "
+              f"({(c1 - c0) * spacing[0]:.0f} x {(r1 - r0) * spacing[1]:.0f} x {(k1 - k0) * spacing[2]:.0f} mm)")
+
+        sim = SimuladorKutter(**(parametros_simulador or {}))
+        vol_db, prof, xs = simular_mama(vol_c, corpo_c, masc_c, spacing, sim, rotulo=lado.replace("_", " "),
+                                        inclusao_c=incl_c, ecogenicidade_inclusao=ecogenicidade_inclusao)
+
+        # geometria: centro do pixel (linha j, coluna i) do US em coordenadas do paciente
+        o = img_c.GetOrigin()                                      # centro do voxel [0,0,0] do recorte
+        origem_us = (o[0] + xs[0] - 0.5 * spacing[0], o[1] + prof[0] - 0.5 * spacing[1], o[2])
+        esp_us = (sim.dx_fino, sim.dz_fino * 2, spacing[2])
+        dr = sim.faixa_dinamica_db
+        us8 = np.round((vol_db + dr) / dr * 255.0).astype(np.uint8)
         pasta_lado = os.path.join(pasta_saida, lado)
+        nome = "direita" if lado == "mama_direita" else "esquerda"
+        escrever_serie_dicom(us8, origem_us, esp_us, tags, os.path.join(pasta_lado, "US"),
+                             f"US simulado (Kutter 2009) - mama {nome}", "US", 900 + 2 * n_lado,
+                             extras={"0028|1050": "128", "0028|1051": "256",
+                                     "0018|6030": str(sim.f0_mhz * 1e6)})
+        print(f"   -> DICOM US: {os.path.join(pasta_lado, 'US')} ({us8.shape[0]} fatias, "
+              f"{us8.shape[2]} x {us8.shape[1]} pixels de {esp_us[0]:.3f} x {esp_us[1]:.3f} mm)")
+
         if salvar_ct:
-            ct = vol[k0:k1, r0:r1, c0:c1].copy()
+            ct = vol_c.copy()
             if mascarar_ct:
-                ct[~sep["mascaras"][lado][k0:k1, r0:r1, c0:c1]] = -1000.0
+                ct[~masc_c] = -1000.0
             escrever_serie_dicom(np.round(ct).astype(np.int16), img_c.GetOrigin(), spacing, tags,
-                                 os.path.join(pasta_lado, "CT"), f"TC recortada - mama {nomes[lado]}", "CT",
+                                 os.path.join(pasta_lado, "CT"), f"TC recortada - mama {nome}", "CT",
                                  901 + 2 * n_lado,
                                  extras={"0028|1052": "0", "0028|1053": "1", "0028|1050": "40", "0028|1051": "400"})
             print(f"   -> DICOM TC: {os.path.join(pasta_lado, 'CT')}")
-        if inclusoes[lado] is not None:
-            escrever_serie_dicom(inclusoes[lado][k0:k1, r0:r1, c0:c1].astype(np.uint8), img_c.GetOrigin(), spacing,
-                                 tags, os.path.join(pasta_lado, "INCLUSAO"),
-                                 f"Inclusao (PET {int(100 * fracao_suv)}% SUVmax) - mama {nomes[lado]}",
+        if incl_c is not None:
+            # mapa de rotulos da inclusao (0/1) na grade da TC recortada, para conferir no Slicer
+            escrever_serie_dicom(incl_c.astype(np.uint8), img_c.GetOrigin(), spacing, tags,
+                                 os.path.join(pasta_lado, "INCLUSAO"), f"Inclusao (PET {int(100 * fracao_suv)}% SUVmax) - mama {nome}",
                                  "OT", 905 + n_lado, extras={"0028|1050": "0.5", "0028|1051": "1"})
             print(f"   -> DICOM inclusao: {os.path.join(pasta_lado, 'INCLUSAO')}")
+        resultados[lado] = dict(us_db=vol_db, ct=vol_c, mascara=masc_c, prof=prof, xs=xs, inclusao=incl_c,
+                                caixa=(k0, k1, r0, r1, c0, c1), dr=dr)
 
-    # ---------------- transdutores ----------------
-    if not transdutores:
-        transdutores = [dict(nome="T1", mama="mama_esquerda" if inclusoes["mama_esquerda"] is not None
-                             else "mama_direita")]
-    dx, dy, dz = spacing
-    resultados = []
-    for n_t, cfg in enumerate(transdutores):
-        cfg = dict(cfg)
-        nome_t = cfg.get("nome", f"T{n_t + 1}")
-        lado = cfg.get("mama", "mama_esquerda")
-        if lado not in LADOS:
-            raise ValueError(f"mama deve ser uma de {LADOS}, nao '{lado}'")
-        mascara = sep["mascaras"][lado]
-        largura = float(cfg.get("largura_mm", 36.8))
-        profundidade = float(cfg.get("profundidade_mm", 50.0))
-        f_mama = np.where(mascara.any(axis=(1, 2)))[0]
-        fatias = cfg.get("fatias") or (int(f_mama[0]), int(f_mama[-1]))
-        fatias = (max(int(fatias[0]), 0), min(int(fatias[1]), vol.shape[0] - 1))
-        alvo = inclusoes[lado] if inclusoes[lado] is not None else mascara
-        k_ref = cfg.get("fatia_referencia")
-        if k_ref is None:
-            k_ref = int(np.argmax(alvo.sum(axis=(1, 2))))
-        modo = cfg.get("modo", "manual")
-        print(f"7. TRANSDUTOR {nome_t} ({lado.replace('_', ' ')}, modo {modo})")
-        if modo == "clique":
-            centro, angulo = escolher_transdutor_clique(vol, mascara, k_ref, spacing, largura, profundidade,
-                                                        titulo=f"Transdutor {nome_t}")
-        elif cfg.get("centro_mm") is not None:
-            centro, angulo = tuple(cfg["centro_mm"]), float(cfg.get("angulo_graus", 0.0))
-        else:
-            centro, angulo = posicao_automatica(mascara, k_ref, spacing, cfg.get("folga_mm", 3.0)), \
-                float(cfg.get("angulo_graus", 0.0))
-        print(f"   -> centro_mm = ({centro[0]:.1f}, {centro[1]:.1f}), angulo_graus = {angulo:.1f}, "
-              f"largura {largura:.1f} mm, profundidade {profundidade:.1f} mm, fatias {fatias[0]}-{fatias[1]}")
-        print(f"      (para repetir sem clicar: dict(nome='{nome_t}', mama='{lado}', modo='manual', "
-              f"centro_mm=({centro[0]:.1f}, {centro[1]:.1f}), angulo_graus={angulo:.1f}, "
-              f"largura_mm={largura}, profundidade_mm={profundidade}, fatias={tuple(fatias)}))")
-
-        sim = SimuladorKutter(**(parametros_simulador or {}))
-        vol_db, prof, lat, u, d = simular_transdutor(
-            vol, corpo, mascara, inclusoes[lado], spacing, sim, centro, angulo, largura, profundidade,
-            fatias, limitar_a_mama=limitar_a_mama, ecogenicidade_inclusao=ecogenicidade_inclusao,
-            rotulo=f"{nome_t}")
-
-        # geometria DICOM: pixel (coluna i, linha j) = centro + lat[i]*u + prof[j]*d, na fatia k
-        pto = lambda x_mm, y_mm, k: img.TransformContinuousIndexToPhysicalPoint((x_mm / dx - 0.5, y_mm / dy - 0.5, float(k)))
-        p00 = np.array(pto(centro[0] + lat[0] * u[0] + prof[0] * d[0], centro[1] + lat[0] * u[1] + prof[0] * d[1], fatias[0]))
-        ex = np.array(pto(centro[0] + (lat[0] + 1) * u[0], centro[1] + (lat[0] + 1) * u[1], fatias[0])) - \
-            np.array(pto(centro[0] + lat[0] * u[0], centro[1] + lat[0] * u[1], fatias[0]))
-        ey = np.array(pto(centro[0] + d[0], centro[1] + d[1], fatias[0])) - np.array(pto(centro[0], centro[1], fatias[0]))
-        ez = np.array(pto(centro[0], centro[1], fatias[0] + 1)) - np.array(pto(centro[0], centro[1], fatias[0]))
-        D = np.stack([ex / np.linalg.norm(ex), ey / np.linalg.norm(ey), ez / np.linalg.norm(ez)], axis=1)
-        esp_us = (sim.dx_fino, sim.dz_fino * 2, dz)
-        dr = sim.faixa_dinamica_db
-        us8 = np.round((vol_db + dr) / dr * 255.0).astype(np.uint8)
-        pasta_t = os.path.join(pasta_saida, lado, f"US_{nome_t}")
-        escrever_serie_dicom(us8, p00, esp_us, tags, pasta_t,
-                             f"US simulado {nome_t} (Kutter 2009) - mama {nomes[lado]}", "US", 920 + n_t,
-                             extras={"0028|1050": "128", "0028|1051": "256",
-                                     "0018|6030": str(sim.f0_mhz * 1e6)},
-                             direcao=D)
-        print(f"   -> DICOM US: {pasta_t} ({us8.shape[0]} fatias, {us8.shape[2]} x {us8.shape[1]} pixels "
-              f"de {esp_us[0]:.3f} x {esp_us[1]:.3f} mm)")
-        resultados.append(dict(nome=nome_t, mama=lado, centro_mm=centro, angulo_graus=angulo, largura_mm=largura,
-                               profundidade_mm=profundidade, fatias=fatias, k_ref=k_ref, us_db=vol_db,
-                               prof=prof, lat=lat, u=u, d=d, dr=dr))
-
-    # ---------------- figura: sonda sobre a TC + imagem simulada ----------------
-    ny, nx = vol.shape[1:]
-    fig, ax = plt.subplots(2, len(resultados), figsize=(7 * len(resultados), 11), squeeze=False)
-    for j, R in enumerate(resultados):
-        k = int(np.clip(R["k_ref"], R["fatias"][0], R["fatias"][1]))
-        c, u, d = np.array(R["centro_mm"]), R["u"], R["d"]
-        W, P = R["largura_mm"], R["profundidade_mm"]
-        cantos = np.array([c - W / 2 * u, c + W / 2 * u, c + W / 2 * u + P * d, c - W / 2 * u + P * d, c - W / 2 * u])
-        a0 = ax[0, j]
-        a0.imshow(vol[k], cmap="bone", vmin=-200, vmax=300, extent=[0, nx * dx, ny * dy, 0])
-        a0.contour(sep["mascaras"][R["mama"]][k], [0.5], colors="cyan", linewidths=1, extent=[0, nx * dx, 0, ny * dy])
-        if inclusoes[R["mama"]] is not None and inclusoes[R["mama"]][k].any():
-            a0.contour(inclusoes[R["mama"]][k], [0.5], colors="lime", linewidths=1.2, extent=[0, nx * dx, 0, ny * dy])
-        a0.plot(cantos[:, 0], cantos[:, 1], "y--", lw=1)
-        a0.plot(cantos[:2, 0], cantos[:2, 1], color="orange", lw=5, solid_capstyle="butt")   # face da sonda
-        a0.annotate("", xy=c + 0.35 * P * d, xytext=c, arrowprops=dict(color="orange", arrowstyle="->", lw=2))
-        xs_, ys_ = cantos[:, 0], cantos[:, 1]
-        a0.set_xlim(xs_.min() - 30, xs_.max() + 30); a0.set_ylim(ys_.max() + 30, ys_.min() - 30)
-        a0.set_title(f"{R['nome']}: fatia {k}, centro ({c[0]:.0f}, {c[1]:.0f}) mm, angulo {R['angulo_graus']:.0f} graus")
-        a0.set_xlabel("x (mm)"); a0.set_ylabel("y (mm)")
-        a1 = ax[1, j]
-        a1.imshow(R["us_db"][k - R["fatias"][0]], cmap="gray", vmin=-R["dr"], vmax=0,
-                  extent=[R["lat"][0], R["lat"][-1], R["prof"][-1], R["prof"][0]])
-        a1.set_title(f"US simulado {R['nome']} - {R['mama'].replace('_', ' ')}")
-        a1.set_xlabel("lateral (mm)"); a1.set_ylabel("profundidade (mm)")
+    # figura final: TC recortada x US simulado na fatia de maior area de cada mama
+    fig, ax = plt.subplots(2, 2, figsize=(13, 10))
+    for j, lado in enumerate(LADOS):
+        R = resultados[lado]
+        alvo = R["inclusao"] if R["inclusao"] is not None else R["mascara"]
+        k = int(np.argmax(alvo.sum(axis=(1, 2))))
+        ny_c, nx_c = R["ct"].shape[1:]
+        ax[0, j].imshow(np.where(R["mascara"][k], R["ct"][k], -1000), cmap="bone", vmin=-200, vmax=200,
+                        extent=[0, nx_c * spacing[0], ny_c * spacing[1], 0])
+        ax[0, j].set_title(f"TC recortada - {lado.replace('_', ' ')} (fatia {R['caixa'][0] + k})")
+        if R["inclusao"] is not None and R["inclusao"][k].any():
+            for a in (ax[0, j], ax[1, j]):
+                a.contour(R["inclusao"][k], [0.5], colors="lime", linewidths=1.2,
+                          extent=[0, nx_c * spacing[0], 0, ny_c * spacing[1]])
+        ax[1, j].imshow(R["us_db"][k], cmap="gray", vmin=-R["dr"], vmax=0,
+                        extent=[R["xs"][0], R["xs"][-1], R["prof"][-1], R["prof"][0]])
+        ax[1, j].set_title(f"US simulado - {lado.replace('_', ' ')}")
+        for a in (ax[0, j], ax[1, j]):
+            a.set_xlabel("x (mm)"); a.set_ylabel("profundidade (mm)")
     plt.tight_layout()
-    arq = os.path.join(pasta_saida, "resultado_transdutores.png")
+    arq = os.path.join(pasta_saida, "resultado_mamas.png")
     plt.savefig(arq, dpi=80)
     print(f"Figura final: {arq}")
     if mostrar_figuras:
@@ -636,43 +657,46 @@ if __name__ == "__main__":
     # ------------------------- CONFIGURACAO -------------------------
     CAMINHO_SERIE = os.path.join(PASTA_SCRIPT, "2-CTAC-14691")   # serie CTAC do QIN-BREAST
     PASTA_SAIDA = os.path.join(PASTA_SCRIPT, "saida_US_mamas")
-    OFFSET_CORTE_MM = 10.0      # quanto alem da pele da linha media entra no recorte (base da mama)
-    PROTRUSAO_MIN_MM = 10.0     # fatias em que a mama se projeta menos que isso ficam de fora
-    MEIO_COLUNA = None          # coluna da linha media (None = automatico pelo sulco intermamario)
+    # CORTE DAS MAMAS
+    #   "clique"    : o usuario marca, em cada mama, a linha vertical (limite medial) e dois pontos da
+    #                 linha de corte posterior, que pode ser inclinada (acompanhando a parede toracica).
+    #                 O programa imprime LINHAS_CORTE pronto para repetir sem clicar.
+    #   "manual"    : usa LINHAS_CORTE (em mm, mesmos eixos das figuras: x para a direita, y para baixo)
+    #   "automatico": sulco intermamario + linha horizontal OFFSET_CORTE_MM alem da pele (versao anterior)
+    MODO_CORTE = "clique"
+    LINHAS_CORTE = None         # ex. (serie QIN-BREAST-01-0002):
+    # LINHAS_CORTE = {"mama_direita":  {"x_medial_mm": 364.0, "linha_mm": ((362.0, 365.0), (215.0, 405.0)),
+    #                                   "z_mm": (85.0, 185.0)},
+    #                 "mama_esquerda": {"x_medial_mm": 367.0, "linha_mm": ((369.0, 365.0), (505.0, 400.0)),
+    #                                   "z_mm": (100.0, 195.0)}}
+    #   x_medial_mm: linha vertical (limite medial); linha_mm: dois pontos da linha de corte inclinada;
+    #   z_mm: limites inferior e superior da mama (opcional; sem ele valem todas as fatias que passam da linha)
+    FATIA_REFERENCIA_CORTE = None   # fatia mostrada para o clique (None = fatia do mamilo mais anterior)
+    OFFSET_CORTE_MM = 10.0      # (automatico) quanto alem da pele da linha media entra no recorte
+    PROTRUSAO_MIN_MM = 10.0     # fatias em que a mama passa menos que isso da linha de corte ficam de fora
+    MEIO_COLUNA = None          # (automatico) coluna da linha media (None = pelo sulco intermamario)
     SALVAR_CT = True            # grava tambem a TC recortada de cada mama
     MASCARAR_CT = True          # na TC gravada, fora da mama = -1000 HU
     CONFIRMAR = True            # pergunta se a separacao esta correta antes de simular
     MOSTRAR_FIGURAS = True
-    PARAMETROS_SIMULADOR = dict(f0_mhz=5.0)   # qualquer parametro de SimuladorKutter (alpha_mistura, ...)
+    # Parametros do simulador (qualquer argumento de SimuladorKutter pode entrar aqui)
+    PARAMETROS_SIMULADOR = dict(
+        f0_mhz=5.0,
+        faixa_dinamica_db=35.0,            # exibicao: 30-40 dB separa gordura, glandula e lesao
+        ecogenicidade_minima=0.05,         # gordura: quanto menor, mais escura (glandula ~ +12 dB)
+        alpha_mistura=0.0009,              # peso do speckle em relacao as reflexoes [Eq. 6]
+        elementos_ativos_espalhamento=12,  # janela de Hann no speckle (0 = sem, grao mais fino)
+        normalizar_pico_reflexao=True,     # reflexoes com pico preservado (correcao)
+        suavizacao_ct_z_mm=1.5,            # TC suavizada para calcular Z (sem reflexoes do ruido)
+    )
     # Inclusao a partir do PET do mesmo estudo (None = sem inclusao)
     PASTA_PET = os.path.join(PASTA_SCRIPT, "3-PET AC 3DWB-52072")
     ECOGENICIDADE_INCLUSAO = 0.1   # mapa de espalhamento na lesao (gordura ~0.2, glandula ~1): hipoecoica
     FRACAO_SUV = 0.40              # limiar de segmentacao: 40% do SUVmax
     SUV_MINIMO = 2.5               # abaixo disso considera que a mama nao tem inclusao
-
-    # TRANSDUTOR(ES): um dicionario por posicao de sonda (podem ser varios).
-    #   nome            : nome da serie (pasta US_<nome>)
-    #   mama            : "mama_direita" ou "mama_esquerda"
-    #   modo            : "clique" (escolhe na tela) ou "manual" (usa centro_mm/angulo_graus)
-    #   centro_mm       : (x, y) do centro da face da sonda, em mm, como nos eixos das figuras
-    #                     (None no modo manual = sobre o mamilo, folga_mm acima da pele)
-    #   angulo_graus    : 0 = feixe de anterior para posterior; > 0 gira para a esquerda da paciente
-    #   largura_mm      : largura da face (L12-5: 36.8 mm)
-    #   profundidade_mm : profundidade da imagem
-    #   fatias          : (primeira, ultima) fatia da varredura S-I (None = toda a mama)
-    #   fatia_referencia: fatia mostrada para o clique e na figura (None = maior area da lesao/mama)
-    # No modo clique o programa imprime a linha pronta para repetir a mesma posicao no modo manual.
-    TRANSDUTORES = [
-        dict(nome="T1", mama="mama_esquerda", modo="clique", angulo_graus=0.0,
-             largura_mm=36.8, profundidade_mm=50.0, fatias=None),
-        # exemplo manual:
-        # dict(nome="T2", mama="mama_direita", modo="manual", centro_mm=(200.0, 315.0),
-        #      angulo_graus=-20.0, largura_mm=36.8, profundidade_mm=50.0, fatias=(30, 50)),
-    ]
-    LIMITAR_A_MAMA = False  # False: mostra tudo que a sonda "ve" (padrao); True: zera fora da mama
     # ----------------------------------------------------------------
 
     processar(CAMINHO_SERIE, PASTA_SAIDA, OFFSET_CORTE_MM, PROTRUSAO_MIN_MM, MEIO_COLUNA,
               SALVAR_CT, MASCARAR_CT, CONFIRMAR, MOSTRAR_FIGURAS, PARAMETROS_SIMULADOR,
               PASTA_PET if os.path.isdir(PASTA_PET) else None, ECOGENICIDADE_INCLUSAO, FRACAO_SUV, SUV_MINIMO,
-              TRANSDUTORES, LIMITAR_A_MAMA)
+              modo_corte=MODO_CORTE, linhas_corte=LINHAS_CORTE, fatia_referencia_corte=FATIA_REFERENCIA_CORTE)

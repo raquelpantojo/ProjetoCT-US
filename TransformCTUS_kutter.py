@@ -156,16 +156,17 @@ class SimuladorKutter:
                  elementos_ativos_espalhamento: int = 12, janela: str = "hann",
                  sigma_reflexao_mm: float = 0.55, sigma_transmissao_mm: float = 1.45,
                  absorcao: str = "osso", janela_literal: bool = False,
+                 normalizar_pico_reflexao: bool = True, suavizacao_ct_z_mm: float = 1.5,
                  saturacao_estiramento: float = 0.05,
                  suavizacao_ct_mm: float = 1.5,
                  modo_bordas: str = "canny", limiar_borda_alto: float = 15.0,
                  limiar_borda_baixo: float = 8.0, percentil_bordas: float = 95.0,
                  valor_borda: float = 1.0,
-                 ecogenicidade_minima: float = 0.2,
+                 ecogenicidade_minima: float = 0.05,
                  escala_deriche_mm: float = 1.5,
                  espalhadores_por_celula: float = 10.0, modelo_amplitude: str = "media_zero",
                  desvio_amplitude: float = 0.1,
-                 tgc_db_cm_mhz: float = 0.0, faixa_dinamica_db: float = 50.0,
+                 tgc_db_cm_mhz: float = 0.0, faixa_dinamica_db: float = 35.0,
                  referencia_log: str = "max",
                  semente: int = 0):
         self.f0_mhz = f0_mhz
@@ -186,6 +187,12 @@ class SimuladorKutter:
         self.sigma_transmissao_mm = sigma_transmissao_mm
         self.absorcao = absorcao                      # "nenhuma" (Eq. 5 literal), "osso" (padrao) ou "todas"
         self.janela_literal = janela_literal
+        # G_s1 com pico unitario: o artigo da sigma_R = 1,8 pixel da imagem DELE; convertido para mm
+        # na nossa grade fina (~14 amostras), um filtro de soma 1 dividia o pico de cada interface
+        # por ~36 (-15,5 dB) e as reflexoes sumiam sob o speckle (ver Diagnostico_etapas.py).
+        self.normalizar_pico_reflexao = normalizar_pico_reflexao
+        # TC suavizada (no plano) so para calcular Z: evita reflexoes geradas pelo ruido da CTAC
+        self.suavizacao_ct_z_mm = suavizacao_ct_z_mm
         self.referencia_log = referencia_log          # "max" (Eq. 7) ou "percentil"
         self.p_lambert = expoente_lambert
         self.saturacao = saturacao_estiramento
@@ -411,6 +418,15 @@ class SimuladorKutter:
         dx, dy, _ = spacing
         hu_slice = np.where(corpo_slice, hu_slice, 0.0).astype(np.float32)
         hu = ndimage.map_coordinates(hu_slice, coords, order=1, mode="nearest")
+        if self.suavizacao_ct_z_mm > 0:
+            # suavizacao normalizada so dentro do corpo: a interface agua -> pele continua nitida
+            sg = (self.suavizacao_ct_z_mm / dy, self.suavizacao_ct_z_mm / dx)
+            peso = ndimage.gaussian_filter(corpo_slice.astype(np.float32), sg)
+            hu_z_slice = ndimage.gaussian_filter(hu_slice * corpo_slice, sg) / np.maximum(peso, 1e-3)
+            hu_z_slice = np.where(corpo_slice, hu_z_slice, 0.0).astype(np.float32)
+            hu_z = ndimage.map_coordinates(hu_z_slice, coords, order=1, mode="nearest")
+        else:
+            hu_z = hu
         corpo_s = ndimage.gaussian_filter(corpo_slice.astype(np.float32), 1.0)
         corpo = ndimage.map_coordinates(corpo_s, coords, order=1, mode="constant") > 0.5
         w = ndimage.map_coordinates(roi_slice.astype(np.float32), coords, order=1, mode="constant") * corpo
@@ -419,11 +435,12 @@ class SimuladorKutter:
 
         # Fora do corpo / ROI -> agua (0 HU)
         hu = hu * w
+        hu_z = hu_z * w
 
         # 1) Z: linear no HU para tecido mole; ar e osso segmentados por limiar [KSN sec. 2.1]
-        Z = Z_AGUA * (hu + 1000.0) / 1000.0
-        Z = np.where(hu < self.limiar_ar_hu, Z_AR, Z)
-        Z = np.where(hu > self.limiar_osso_hu, self.z_osso, Z)
+        Z = Z_AGUA * (hu_z + 1000.0) / 1000.0
+        Z = np.where(hu_z < self.limiar_ar_hu, Z_AR, Z)
+        Z = np.where(hu_z > self.limiar_osso_hu, self.z_osso, Z)
         Z = np.maximum(Z, Z_AR)
 
         # 2) alpha_R [Eq. 1] na escala de um voxel da TC + maximo local ao longo do feixe
@@ -464,6 +481,8 @@ class SimuladorKutter:
         s1 = (self.sigma_reflexao_mm / self.dz_fino, self.sigma_reflexao_mm / self.dx_fino)
         s2 = (self.sigma_transmissao_mm / self.dz_fino, self.sigma_transmissao_mm / self.dx_fino)
         G1_Ir = ndimage.gaussian_filter(Ir, s1, mode="nearest") if self.sigma_reflexao_mm > 0 else Ir
+        if self.normalizar_pico_reflexao and self.sigma_reflexao_mm > 0:
+            G1_Ir = G1_Ir * np.sqrt(2.0 * np.pi) * s1[0]           # pico de uma interface preservado
         G2_aT = ndimage.gaussian_filter(aT_acum, s2, mode="nearest") if self.sigma_transmissao_mm > 0 else aT_acum
         Ius = (G1_Ir + self.alpha_mistura * G2_aT) * Is
 
